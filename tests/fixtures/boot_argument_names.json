@@ -116,6 +116,8 @@
     "-n97displaytrace"
   ],
   "-wex-tgl-edp-keep": [],
+  "-wex-edp-fix-training": [],
+  "-wex-vbt-panel-fallback": [],
   "-wex-tgl-off": [
     "-igfxtgloff"
   ],

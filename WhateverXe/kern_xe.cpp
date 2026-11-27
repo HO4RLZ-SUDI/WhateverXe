@@ -4461,6 +4461,23 @@ void XE::processKernel(KernelPatcher &patcher, DeviceInfo *info) {
 	// (0x2910) read hangs the machine with a machine check. The donor treats 0 as "no sample".
 	tglSkipGPUTicks=checkKernelArgument("-wex-skip-gputicks");
 	IORegistryEntry::getRegistryRoot()->setProperty("WhateverXeSkipGPUTicks",tglSkipGPUTicks);
+	// Opt-in (-wex-vbt-panel-fallback): the VBT named no panel (0xff), had no PnP entry for it and its profiles
+	// disagree, so firmwarePorts.panel stayed invalid and the eDP swing/PPS paths that require it never ran.
+	// Re-parse the VBT copy captureFirmware published, with Linux i915's panel-type-0 fallback.
+	if (checkKernelArgument("-wex-vbt-panel-fallback") && physicalGPU && firmwarePorts.valid() && !firmwarePorts.panel.valid) {
+		auto vbt = OSDynamicCast(OSData, physicalGPU->getProperty("TGLVBT"));
+		if (vbt && vbt->getLength()) {
+			XELP::VBT::panelTypeZeroFallback() = true;
+			const auto again = XELP::VBT::parse(vbt->getBytesNoCopy(), vbt->getLength(), xeProfile.family);
+			XELP::VBT::panelTypeZeroFallback() = false;
+			if (again.valid() && again.panel.valid && again.present == firmwarePorts.present)
+				firmwarePorts.panel = again.panel;
+		}
+		const auto &panel = firmwarePorts.panel;
+		uint32_t facts[] {panel.valid, panel.type, panel.ddi, panel.lowSwing, panel.hobl, panel.pwmPresent,
+			panel.backlightType, panel.controller, panel.backlightValid};
+		IORegistryEntry::getRegistryRoot()->setProperty("WEXVBTPanelFallback", facts, sizeof(facts));
+	}
     // ADLP_LOAD_ONLY_KERNEL: do not enter TGL MMIO/FIA, bootstrap or VM setup.
     const auto physicalEntry=XELP::deviceEntry(xeProfile.identity);
     adlpLoadOnly=physicalEntry && xeProfile.mobileDisplay13() &&
@@ -14651,6 +14668,20 @@ void XE::processNativePanel(KernelPatcher &patcher,size_t index,mach_vm_address_
     IORegistryEntry::getRegistryRoot()->setProperty("ADLSPanelPWMReady",adlsPanelPWMReady);
     patcher.clearError();
     // ADLS_PANEL_PWM_INSTALL_END
+   }
+
+   // AI 修改: opt-in internal eDP training fix. The implementation and its
+   // state live in kern_tgl_edp_training.{hpp,cpp} to keep this file small.
+   if(tglActive && !display13FramebufferRequested &&
+    XELP::displayAdapter(xeProfile.family)==XELP::DisplayAdapter::TGL &&
+    XELP::PanelPower::nativePPS0(firmwarePorts,xeProfile.family)) {
+    TGLEDPTraining::Host host;
+    host.active=&tglActive;
+    host.observationController=&tglObservationController;
+    host.orgRegisterRead=&orgTGLRegisterRead;
+    host.ports=&firmwarePorts;
+    host.adlsLightUp=orgADLSLightUpEDP;
+    TGLEDPTraining::install(tglEDPTraining,patcher,index,address,size,host);
    }
 
 			if (tglActive) {

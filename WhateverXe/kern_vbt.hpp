@@ -133,6 +133,11 @@ inline uint16_t panelMatches(const uint8_t *b,const uint8_t *ptr,size_t ptrSize,
     }
     return exact?exact:undated;
 }
+// -wex-vbt-panel-fallback (opt-in, set before parsing): when the VBT names no panel (0xff) and no PnP entry matches the
+// panel's EDID, use panel type 0 as Linux i915 does (PANEL_TYPE_FALLBACK) instead of rejecting disagreeing profiles.
+// Seen on an ASUS TGL-H laptop whose VBT has no block 41 and no PnP entry for its NCP 004D panel. Constant-initialized,
+// so no guard is emitted.
+inline bool &panelTypeZeroFallback() {static bool enabled=false;return enabled;}
 inline bool samePanelFacts(const Ports::Panel &a,const Ports::Panel &b) {
     if(a.lowSwing!=b.lowSwing || a.hobl!=b.hobl ||
        a.backlightValid!=b.backlightValid || a.pwmPresent!=b.pwmPresent ||
@@ -181,7 +186,7 @@ inline void panelFacts(const uint8_t *b,size_t header,size_t size,Ports &ports,c
     // the same equivalence rule; UINT32_MAX reports that no index was selected.
     uint16_t candidates=requested<16?uint16_t(1U<<requested):
         identityDuplicate?0:panelMatches(b,ptr,ptrSize,data,dataSize,identity);
-    if(!candidates)candidates=0xffff;
+    if(!candidates)candidates=(requested==0xff && panelTypeZeroFallback())?1:0xffff;
     bool found=false;unsigned count=0;
     for(unsigned type=0;type<16;++type)if(candidates&(1U<<type)) {
         Ports::Panel p;p.type=type;p.ddi=internal;
