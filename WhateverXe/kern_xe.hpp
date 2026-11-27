@@ -920,6 +920,8 @@ private:
 	static void wrapTGLHostIRQProcess(void *bridge);
 	static void wrapTGLHostIRQService(void *bridge, const uint64_t *bits);
 	static void wrapTGLHostSWInterrupt(void *streamer, void *source, int count);
+	static uint64_t wrapTGLLastContextRunTime(const void *streamer, uint8_t engine);
+	mach_vm_address_t orgTGLLastContextRunTime {};
 	static void wrapTGLHostCSBIDPanic(const uint32_t *entry);
 	static void wrapTGLHostCSB(void *streamer, uint32_t *entry, uint32_t *index);
 	bool installTGLCSB12(KernelPatcher &patcher, size_t index, mach_vm_address_t address, size_t size);

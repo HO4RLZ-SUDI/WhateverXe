@@ -118,6 +118,8 @@
   "-wex-tgl-edp-keep": [],
   "-wex-edp-fix-training": [],
   "-wex-vbt-panel-fallback": [],
+  "-wex-tgl-phy-probe": [],
+  "-wex-tgl-throttle-guard": [],
   "-wex-tgl-off": [
     "-igfxtgloff"
   ],
@@ -153,5 +155,8 @@
   "-wex-dsi-hdmi-test": [],
   "-wex-dsi-power-test": [],
   "-wex-skip-gputicks": [],
-  "-wex-tgl-sink-rate": []
+  "-wex-tgl-sink-rate": [],
+  "-wex-tgl-edp-adopt": [],
+  "-wex-tgl-fb-open": [],
+  "-wex-tgl-edp-force": []
 }

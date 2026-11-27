@@ -56,10 +56,13 @@ template<class Read> bool capture(Read read, unsigned pipe, Stream &s) {
 // Restrict the alternative to the same SDR mode, same lane count and port,
 // and a depth promotion. The original timing and the full-mode plan remain
 // owned by the donor. It gets the last word on the normalized partial plan.
-inline bool propose(const Stream &stream, const Receiver &sink, const void *timing, uint32_t *plan) {
+// sameDepth (-wex-tgl-edp-adopt) also admits the firmware's own depth, so a
+// request matching the GOP raster keeps the GOP link instead of retraining it.
+inline bool propose(const Stream &stream, const Receiver &sink, const void *timing, uint32_t *plan,
+                    bool sameDepth = false) {
     const unsigned depth = (stream.func >> 20) & 7, desired = (plan[1] >> 20) & 7;
     const unsigned bpc[] = {8,10,6}, enc[] = {2,4,1}, msa[] = {0x20,0x40,0};
-    if (depth > 2 || desired > 2 || bpc[depth] >= bpc[desired] ||
+    if (depth > 2 || desired > 2 || bpc[depth] > bpc[desired] || (!sameDepth && bpc[depth] == bpc[desired]) ||
         ((stream.func ^ plan[1]) & ~0x700000U) || field<uint16_t>(timing,0x88) != 1 ||
         field<uint16_t>(timing,0x8a) != enc[desired] || field<uint16_t>(timing,0x8e) > 1 ||
         field<uint32_t>(timing,0x84) || field<uint16_t>(timing,0x90) || (plan[3] & 0xc006) ||
@@ -75,6 +78,13 @@ inline bool propose(const Stream &stream, const Receiver &sink, const void *timi
     if ((retainedTiming.minPixelClock && retainedTiming.minPixelClock > retainedTiming.pixelClock) ||
         (retainedTiming.maxPixelClock && retainedTiming.maxPixelClock < retainedTiming.pixelClock)) return false;
     retainedTiming.minPixelClock = retainedTiming.maxPixelClock = retainedTiming.pixelClock;
+    // The GOP may clock the same raster a little off the EDID value (FX506HF: 355.62 MHz for a 354.73 MHz
+    // mode, 0.25%). Keeping its link keeps its clock, so adoption accepts the stream within 0.5%.
+    if (sameDepth) {
+        const auto slack = retainedTiming.pixelClock / 200;
+        retainedTiming.minPixelClock = retainedTiming.pixelClock - slack;
+        retainedTiming.maxPixelClock = retainedTiming.pixelClock + slack;
+    }
     Stream measured = stream;
     // PIPE_MISC BPC is unused on TGL when dithering is off.
     if (!(measured.pipeMisc & 0x10)) measured.pipeMisc = (measured.pipeMisc & ~0xe0U) | (depth << 5);

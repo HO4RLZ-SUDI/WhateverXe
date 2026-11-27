@@ -4461,6 +4461,9 @@ void XE::processKernel(KernelPatcher &patcher, DeviceInfo *info) {
 	// (0x2910) read hangs the machine with a machine check. The donor treats 0 as "no sample".
 	tglSkipGPUTicks=checkKernelArgument("-wex-skip-gputicks");
 	IORegistryEntry::getRegistryRoot()->setProperty("WhateverXeSkipGPUTicks",tglSkipGPUTicks);
+	// Opt-in (-wex-tgl-fb-open): a framebuffer personality gated with IOPropertyMatch {"wex-fb-gate-open":"yes"}
+	// matches only on a boot that asks for it, so a failed framebuffer test needs no kernel collection rebuild.
+	if (checkKernelArgument("-wex-tgl-fb-open") && physicalGPU) physicalGPU->setProperty("wex-fb-gate-open","yes");
 	// Opt-in (-wex-vbt-panel-fallback): the VBT named no panel (0xff), had no PnP entry for it and its profiles
 	// disagree, so firmwarePorts.panel stayed invalid and the eDP swing/PPS paths that require it never ran.
 	// Re-parse the VBT copy captureFirmware published, with Linux i915's panel-type-0 fallback.
@@ -12479,6 +12482,22 @@ bool XE::processTGLAccelerator(KernelPatcher &patcher, size_t index, mach_vm_add
 				auto loadSite=reinterpret_cast<uint8_t *>(address+0x3AA02);
 				hostOK=hostOK && size>0x3AA47 && !memcmp(loadSite,loadBlock,sizeof(loadBlock));
 				if (hostOK) hostOK=patcher.routeMultiple(index,host,arrsize(host),address,size);
+				// Opt-in (-wex-tgl-throttle-guard): IGScheduler5::verifyThrottling calls
+				// IGHardwareCommandStreamer5::getLastContextRunTimeNS on scheduler+0xCA0, which was NULL on a
+				// TGL-H GT1 (9A68) once the accelerator took real work (page fault, CR2 0x70). The donor already
+				// returns 0 when the streamer's stats tracker (+0x70) is NULL; extend that to a NULL streamer.
+				if (checkKernelArgument("-wex-tgl-throttle-guard")) {
+					const char *runTime="__ZNK26IGHardwareCommandStreamer523getLastContextRunTimeNSEh";
+					const uint8_t runTimeHead[]={0x55,0x48,0x89,0xe5,0x48,0x8b,0x7f,0x70,0x48,0x85,0xff};
+					const auto fn=patcher.solveSymbol<mach_vm_address_t>(index,runTime,address,size);
+					bool guarded=fn==address+0x3AEBC && size>0x3AEC7 && !memcmp(reinterpret_cast<void *>(fn),runTimeHead,sizeof(runTimeHead));
+					if (guarded) {
+						KernelPatcher::RouteRequest route(runTime,wrapTGLLastContextRunTime,orgTGLLastContextRunTime);
+						guarded=patcher.routeMultiple(index,&route,1,address,size);
+					}
+					patcher.clearError();
+					IORegistryEntry::getRegistryRoot()->setProperty("TGLThrottleGuardRouted",guarded);
+				}
                 // Qualify the complete parent bank owner, its native bank0
                 // readers and service consumer before installing retry ownership.
                 if(hostOK) {
@@ -15991,6 +16010,16 @@ void XE::wrapTGLHostIRQService(void *bridge,const uint64_t *bits) {
  FunctionCast(wrapTGLHostIRQService,callbackXE->orgTGLHostIRQService)(bridge,bits);
  tglHostIRQEnd(r);
 }
+uint64_t XE::wrapTGLLastContextRunTime(const void *streamer,uint8_t engine) {
+	if (!streamer) {
+		static uint32_t hits {};
+		const auto n=__sync_add_and_fetch(&hits,1);
+		if (n<=16 || !(n&1023)) IORegistryEntry::getRegistryRoot()->setProperty("TGLThrottleGuardHits",n,32);
+		return 0;
+	}
+	return FunctionCast(wrapTGLLastContextRunTime,callbackXE->orgTGLLastContextRunTime)(streamer,engine);
+}
+
 void XE::wrapTGLHostSWInterrupt(void *streamer,void *source,int count) {
  auto r=tglHostIRQBegin(2,streamer,reinterpret_cast<uintptr_t>(source),count,reinterpret_cast<uintptr_t>(__builtin_return_address(0)));
  FunctionCast(wrapTGLHostSWInterrupt,callbackXE->orgTGLHostSWInterrupt)(streamer,source,count);
@@ -17819,6 +17848,25 @@ uint32_t XE::wrapTGLOptimalLaneCount(void *port, const void *timing, uint32_t bp
 		snprintf(key, sizeof(key), "TGLOptimalLanesFirst%u", static_cast<uint32_t>(r[10]));
 		IORegistryEntry::getRegistryRoot()->setProperty(key, r, sizeof(r));
 	}
+	// Diagnostic (-wex-tgl-phy-probe, read only): combo PHY A as the previous training attempt left it, the same
+	// words TGLComboSignal::program writes and verifies, plus DDI_BUF_CTL A and DP_TP_STATUS A.
+	if (config[0] == 0 && r[10] <= 16 && checkKernelArgument("-wex-tgl-phy-probe")) {
+		auto access = *reinterpret_cast<uint8_t **>(p + 0x578);
+		auto base = access ? *reinterpret_cast<volatile uint8_t **>(access + 0x50) : nullptr;
+		const auto size = access ? *reinterpret_cast<uint32_t *>(access + 0x60) : 0U;
+		if (base && size >= 0x162BA0) {
+			const auto rd = [&](uint32_t reg) { return *reinterpret_cast<volatile uint32_t *>(base + reg); };
+			uint32_t v[20] {static_cast<uint32_t>(r[10]), *reinterpret_cast<uint32_t *>(p + 0x128),
+				rd(0x162804), rd(0x162014), rd(0x162028), rd(0x162894), rd(0x64000), rd(0x60544)};
+			for (uint32_t n = 0; n < 4; n++) {
+				v[8 + n] = rd(0x162888 + 0x100 * n);
+				v[12 + n] = rd(0x162890 + 0x100 * n);
+				v[16 + n] = rd(0x16289C + 0x100 * n);
+			}
+			snprintf(key, sizeof(key), "TGLComboPHYA%u", static_cast<uint32_t>(r[10]));
+			IORegistryEntry::getRegistryRoot()->setProperty(key, v, sizeof(v));
+		}
+	}
 	return result;
 }
 
@@ -18629,8 +18677,10 @@ bool XE::selectTGLBootDepth(bool update, void *controller, void *fb, void *path,
     if (!update || ddi > 1 || ((boot.firmware.func >> 27) & 15) != ddi+1 ||
         !self->orgTGLReadAUX || (phase == Retained && (boot.fb != fb || boot.path != path ||
         boot.mode != mode || memcmp(&boot.request,timing,sizeof(boot.request))))) return finish(1);
-    // A request which needs no depth promotion has no bootstrap alternative.
-    if (!((wanted[1] ^ boot.firmware.func) & 0x700000)) return finish(2);
+    // A request which needs no depth promotion has no bootstrap alternative,
+    // unless -wex-tgl-edp-adopt asks to keep the firmware link at its own depth.
+    const bool adopt = checkKernelArgument("-wex-tgl-edp-adopt");
+    if (!adopt && !((wanted[1] ^ boot.firmware.func) & 0x700000)) return finish(2);
     auto access = field<void *>(controller,0xc40);
     if (!access) return finish(3);
     const auto read = [&](uint32_t reg) {
@@ -18641,15 +18691,61 @@ bool XE::selectTGLBootDepth(bool update, void *controller, void *fb, void *path,
         return TGLEDPHandoff::capture(read,pipe,live) && !memcmp(&boot.firmware,&live,sizeof(live)) &&
             !(read(0x60410+pipe*0x1000) & 0xc006);
     };
-    if (!sameSource()) return finish(4);
+    if (adopt) {
+        // By the time macOS asks for its first mode on this panel, PIPE_MISC dithering (bit 4) is on although the
+        // GOP left it off; the link, timings and DDI are untouched. Adopt the live dither bit, nothing else.
+        Display13Handoff::Stream live {};
+        if (TGLEDPHandoff::capture(read,pipe,live) && (live.pipeMisc ^ boot.firmware.pipeMisc) == 0x10) {
+            auto dithered = boot.firmware;
+            dithered.pipeMisc = live.pipeMisc;
+            if (!memcmp(&dithered,&live,sizeof(live))) boot.firmware = dithered;
+        }
+    }
+    if (!sameSource()) {
+        if (adopt) {
+        // Publish what the boot capture saw and what the pipe holds now, so a changed register is visible.
+        Display13Handoff::Stream live {};
+        const bool captured = TGLEDPHandoff::capture(read,pipe,live);
+        IORegistryEntry::getRegistryRoot()->setProperty("TGLBootDepthFirmware",&boot.firmware,sizeof(boot.firmware));
+        IORegistryEntry::getRegistryRoot()->setProperty("TGLBootDepthLive",&live,sizeof(live));
+        const unsigned bank = pipe * 0x1000;
+        const uint32_t regs[] = {0x45404,0x70008+bank,0x60400+bank,0x60404+bank,0x64000,0x64100,0x46140+4*pipe,
+            0x60540+bank,0x164280,0x46010,0x46014,0x51004,0x60410+bank,0x70030+bank};
+        uint32_t values[1+sizeof(regs)/sizeof(regs[0])] = {captured};
+        for (unsigned i = 0; i < sizeof(regs)/sizeof(regs[0]); ++i) values[1+i] = read(regs[i]);
+        IORegistryEntry::getRegistryRoot()->setProperty("TGLBootDepthLiveRegs",values,sizeof(values));
+        }
+        return finish(4);
+    }
     const auto aux = [&](uint32_t reg,void *out,uint32_t size) {return !wrapTGLReadAUX(port,reg,out,size);};
     Display13Handoff::Receiver sink {}, confirmed {};
     if (!Display13Handoff::receiver(aux,boot.firmware.lanes(),true,sink)) return finish(5);
     uint32_t plan[0xf0/4];
     memcpy(plan,params,sizeof(plan));
-    if (!TGLEDPHandoff::propose(boot.firmware,sink,timing,plan)) return finish(6);
-    if (FunctionCast(wrapTGLRetainedMode,self->orgTGLRetainedMode)(controller,fb,path,plan,timing,scaler))
-        return finish(7);
+    if (!TGLEDPHandoff::propose(boot.firmware,sink,timing,plan,adopt)) {
+        if (adopt) {
+            // What the request asked for, against the fields propose and normalize check.
+            const uint32_t t[] = {field<uint32_t>(timing,0x84), field<uint16_t>(timing,0x88), field<uint16_t>(timing,0x8a),
+                field<uint16_t>(timing,0x8e), field<uint16_t>(timing,0x90), uint32_t(field<uint64_t>(timing,0x28)),
+                uint32_t(field<uint64_t>(timing,0x30)), uint32_t(field<uint64_t>(timing,0x38)), wanted[1], wanted[3],
+                wanted[4], wanted[5], wanted[6], wanted[7], wanted[8], wanted[9], wanted[10], wanted[12],
+                sink.symbolKHz, sink.lanes, sink.enhanced, sink.alternateReset};
+            IORegistryEntry::getRegistryRoot()->setProperty("TGLBootDepthPlan",const_cast<uint32_t *>(t),sizeof(t));
+        }
+        return finish(6);
+    }
+    if (FunctionCast(wrapTGLRetainedMode,self->orgTGLRetainedMode)(controller,fb,path,plan,timing,scaler)) {
+        // hwRegsNeedUpdate wants a full modeset: path state 0x3644 must be 2 and paramsFbCompare checks the
+        // plan against the path's copy at 0x128. Publish both. -wex-tgl-edp-force keeps the verified GOP stream anyway.
+        const bool force = adopt && checkKernelArgument("-wex-tgl-edp-force");
+        if (adopt) {
+            const uint32_t state[] = {field<uint32_t>(path,0x3640), field<uint32_t>(path,0x3644), uint32_t(force)};
+            IORegistryEntry::getRegistryRoot()->setProperty("TGLBootDepthPathState",const_cast<uint32_t *>(state),sizeof(state));
+            IORegistryEntry::getRegistryRoot()->setProperty("TGLBootDepthPathParams",static_cast<uint8_t *>(path)+0x128,sizeof(plan));
+            IORegistryEntry::getRegistryRoot()->setProperty("TGLBootDepthPlanParams",plan,sizeof(plan));
+        }
+        if (!force) return finish(7);
+    }
     if (!Display13Handoff::receiver(aux,boot.firmware.lanes(),true,confirmed) ||
         sink.symbolKHz != confirmed.symbolKHz || sink.enhanced != confirmed.enhanced ||
         sink.alternateReset != confirmed.alternateReset || !sameSource()) return finish(8);
