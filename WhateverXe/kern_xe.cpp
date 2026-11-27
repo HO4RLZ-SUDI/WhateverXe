@@ -17751,7 +17751,35 @@ uint32_t XE::wrapTGLOptimalLaneCount(void *port, const void *timing, uint32_t bp
 	auto &lanes = *reinterpret_cast<uint32_t *>(p + 0x124);
 	r[5] = lanes; r[6] = *reinterpret_cast<uint32_t *>(p + 0x128);
 	r[7] = *reinterpret_cast<uint32_t *>(p + 0x550);
-	r[8] = lanes; r[9] = 0; r[11] = config[0];
+	// -wex-tgl-sink-rate (opt-in): the donor programs its own default rate (HBR2, 0x14) even when the sink's
+	// MAX_LINK_RATE is lower ("Bringup TODO: implement link rate determination from HW values"). Seen on an NCP 004D
+	// eDP panel (DPCD 1.2, HBR x4): the donor chose HBR2 x1; training failed, or passed marginally with a striped
+	// picture, while the firmware ran the panel at HBR x4. The sink's rate comes from the donor's own receiver-
+	// capability read already in the DPCD ring (no extra AUX IO); clamp to it and use every lane the sink offers.
+	auto &rate = *reinterpret_cast<uint32_t *>(p + 0x128);
+	if (tglAUXLock && checkKernelArgument("-wex-tgl-sink-rate") && p[0x11] >= 1 && p[0x11] <= 4 &&
+		(rate == 0x0a || rate == 0x14 || rate == 0x1e)) {
+		uint32_t sinkRate = 0;
+		IOSimpleLockLock(tglAUXLock);
+		const uint32_t count = tglDPCDCount, capacity = arrsize(tglDPCDLast);
+		for (uint32_t i = 0; i < count && i < capacity && !sinkRate; i++) {
+			const auto &w = tglDPCDLast[(count - 1 - i) % capacity].word;
+			if (w[1] == 0 && !w[3] && w[4] && !w[5] && w[6] >= 3 && w[12] == config[0])
+				sinkRate = reinterpret_cast<const uint8_t *>(w + 8)[1];
+		}
+		for (uint32_t i = count < arrsize(tglDPCDFirst) ? count : arrsize(tglDPCDFirst); i-- > 0 && !sinkRate;) {
+			const auto &w = tglDPCDFirst[i].word;
+			if (w[1] == 0 && !w[3] && w[4] && !w[5] && w[6] >= 3 && w[12] == config[0])
+				sinkRate = reinterpret_cast<const uint8_t *>(w + 8)[1];
+		}
+		IOSimpleLockUnlock(tglAUXLock);
+		if ((sinkRate == 0x06 || sinkRate == 0x0a || sinkRate == 0x14) && rate > sinkRate) {
+			rate = sinkRate;
+			lanes = p[0x11];
+			r[9] = 1;
+		}
+	}
+	r[8] = lanes; r[11] = config[0];
 	static uint32_t sequence {};
 	r[10] = __sync_add_and_fetch(&sequence, 1);
 	char key[48]; snprintf(key, sizeof(key), "TGLOptimalLanesLast%u", static_cast<uint32_t>(r[10]) % 32);
